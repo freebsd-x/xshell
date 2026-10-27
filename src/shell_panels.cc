@@ -2062,7 +2062,16 @@ void buildBootEnvPanel(ShellContext& ctx) {
                                 del_btn->setColor({0.45f, 0.45f, 0.50f, 1.0f});
                             } else {
                                 del_btn->setBackgroundColor({0.55f, 0.18f, 0.18f, 1.0f});
-                                del_btn->onClick([be_name, bf]() {
+                                // Destroying a BE is irreversible: the first click
+                                // only arms the button ("Confirm?"), the second deletes.
+                                auto armed = std::make_shared<bool>(false);
+                                del_btn->onClick([be_name, bf, armed,
+                                                  del_weak = std::weak_ptr<ButtonWidget>(del_btn)]() {
+                                    if (!*armed) {
+                                        *armed = true;
+                                        if (auto b = del_weak.lock()) b->setText("Confirm?");
+                                        return;
+                                    }
                                     if (!g_shell_xbus) return;
                                     BeActionRequest req{};
                                     std::strncpy(req.name_, be_name.c_str(), sizeof(req.name_) - 1);
