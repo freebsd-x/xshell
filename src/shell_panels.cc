@@ -3,6 +3,7 @@
 // See shell_panels.h for the ShellContext + the `using namespace` rationale.
 #include "shell_panels.h"
 #include <format>
+#include <cerrno>
 #include <cstring>
 #include <algorithm>
 #include <ctime>
@@ -5549,8 +5550,21 @@ void buildNetworkSharesMountPanel(ShellContext& ctx) {
             if (!g_shell_xbus) return;
             g_shell_xbus->Call("com.freebsdx.NetworkShare",
                 static_cast<uint32_t>(NetworkShareMountOpcode::Mount), payload,
-                [ns_status_lbl, ns_form_col, rebuild_ns](const XBusMessage&) {
-                    ns_status_lbl->setText("Mounted \xe2\x9c\x93");
+                [ns_status_lbl, ns_form_col, rebuild_ns](const XBusMessage& r) {
+                    // The ack carries a status: 0 = mount started (the list
+                    // refreshes on ShareChanged when it finishes), else errno.
+                    uint32_t st = 0;
+                    std::memcpy(&st, r.payload_, sizeof(st));
+                    if (st != 0) {
+                        ns_status_lbl->setText(
+                            st == EPERM   ? "Needs sysctl vfs.usermount=1" :
+                            st == ENOTDIR ? "Mount point must be your own folder" :
+                            st == ENOTSUP ? "Put SMB passwords in ~/.nsmbrc" :
+                                            "Check host / share / user");
+                        ns_status_lbl->setColor({0.95f, 0.40f, 0.40f, 1.0f});
+                        return;
+                    }
+                    ns_status_lbl->setText("Mounting\xe2\x80\xa6");
                     ns_status_lbl->setColor({0.30f, 0.85f, 0.45f, 1.0f});
                     ns_form_col->setVisibility(false);
                     if (rebuild_ns && *rebuild_ns) (*rebuild_ns)();
