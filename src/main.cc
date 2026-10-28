@@ -882,6 +882,18 @@ static void runAutostart() {
         fbx::shared::autostart::Entry e;
         if (!fbx::shared::autostart::parse(body.str(), e) || !fbx::shared::autostart::shouldLaunch(e))
             continue;
+        // A bundle app (Settings → Login Items): launch it like the Launchpad
+        // does, so it gets its current binary and its XAPP_ID.
+        if (!e.app_id.empty()) {
+            auto it = std::find_if(g_app_ids.begin(), g_app_ids.end(),
+                                   [&](const auto& kv) { return kv.second == e.app_id; });
+            if (it != g_app_ids.end()) {
+                LOG_INFO("Autostart: {} (app {})", e.name, e.app_id);
+                launchApp(it->first);
+                continue;
+            }
+            LOG_WARN("Autostart: app {} isn't installed; trying its Exec", e.app_id);
+        }
         std::string cmd = fbx::shared::autostart::commandLine(e.exec);
         if (cmd.empty()) continue;
         LOG_INFO("Autostart: {} ({})", e.name.empty() ? path.filename().string() : e.name, cmd);
