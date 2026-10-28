@@ -268,8 +268,20 @@ void buildStartupItemsPanel(ShellContext& ctx) {
                             ? Color{0.25f, 0.25f, 0.28f, 1.0f}
                             : Color{0.55f, 0.18f, 0.18f, 1.0f});
                         if (!builtin) {
-                            rm_btn->onClick([item_id, rs_weak]() {
+                            // Deletes the .desktop file: the first click only
+                            // arms the button ("Confirm?"), the second removes.
+                            auto armed = std::make_shared<bool>(false);
+                            std::weak_ptr<ButtonWidget> rm_weak = rm_btn;
+                            rm_btn->onClick([item_id, rs_weak, armed, rm_weak]() {
                                 if (!g_shell_xbus) return;
+                                if (!*armed) {
+                                    *armed = true;
+                                    if (auto b = rm_weak.lock()) {
+                                        b->setText("Confirm?");
+                                        b->setFixedSize(60, 22);
+                                    }
+                                    return;
+                                }
                                 StartupRemoveRequest req{};
                                 req.item_id_ = item_id;
                                 g_shell_xbus->Call("com.freebsdx.StartupItems",

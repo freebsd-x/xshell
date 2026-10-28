@@ -7,6 +7,7 @@
 #include "xrender/font_manager.h"
 #include "shared/logger.h"
 #include "shared/user_env.h"
+#include "shared/autostart.h"
 #include "shell_helpers.h"
 #include "shell_query.h"    // MathParser, quickMathEval, searchFiles (carved out)
 #include "shell_panels.h"   // ShellContext + buildXPanel() builders (Phase 2)
@@ -21,6 +22,8 @@
 #include <csignal>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 #include <thread>
 #include <chrono>
 #include <ctime>
@@ -762,15 +765,9 @@ static std::string fmtBps(uint64_t bps) noexcept {
     return std::format("{}B/s", bps);
 }
 
-void launchApp(const std::string& exec_path,
-                      const std::string& file_path) noexcept {
-    LOG_INFO("Launching: {}{}", exec_path, file_path.empty() ? "" : " --open " + file_path);
-    recordAppLaunch();
-
-    // Build argv/envp before fork: the child of a threaded process may only
-    // call async-signal-safe functions, so no setenv/malloc after fork. The
-    // environment is ours + the user's overrides (Settings → Environment) +
-    // the two session vars, which always win.
+// Environment for anything the shell launches: ours + the user's overrides
+// (Settings → Environment) + the two session vars, which always win.
+static std::vector<std::string> childEnv() {
     std::vector<std::string> env_strs;
     auto overridden = [](std::string_view kv, std::string_view key) {
         return kv.size() > key.size() && kv.substr(0, key.size()) == key && kv[key.size()] == '=';
@@ -794,14 +791,18 @@ void launchApp(const std::string& exec_path,
         if (!skip) env_strs.emplace_back(*e);
     }
     env_strs.insert(env_strs.end(), extra.begin(), extra.end());
-    std::vector<char*> envp;
-    for (auto& s : env_strs) envp.push_back(s.data());
+    return env_strs;
+}
+
+// fork + execve `args` with childEnv(). argv/envp are built before fork: the
+// child of a threaded process may only call async-signal-safe functions, so no
+// setenv/malloc after fork. Returns the pid, or -1.
+static pid_t spawnChild(std::vector<std::string> args) {
+    std::vector<std::string> env_strs = childEnv();
+    std::vector<char*> envp, argv;
+    for (auto& e : env_strs) envp.push_back(e.data());
     envp.push_back(nullptr);
-    std::vector<char*> argv{const_cast<char*>(exec_path.c_str())};
-    if (!file_path.empty()) {
-        argv.push_back(const_cast<char*>("--open"));
-        argv.push_back(const_cast<char*>(file_path.c_str()));
-    }
+    for (auto& a : args) argv.push_back(a.data());
     argv.push_back(nullptr);
 
     pid_t pid = fork();
@@ -809,11 +810,22 @@ void launchApp(const std::string& exec_path,
         // Close every FD above stderr so the child starts with a clean table.
         // The app will open its own XBus socket and Vulkan device from scratch.
         closefrom(STDERR_FILENO + 1);
-        execve(exec_path.c_str(), argv.data(), envp.data());
+        execve(argv[0], argv.data(), envp.data());
         static const char kMsg[] = "[xshell] execve failed\n";
         (void)!write(STDERR_FILENO, kMsg, sizeof(kMsg) - 1);
         _exit(1);
-    } else if (pid > 0) {
+    }
+    return pid;
+}
+
+void launchApp(const std::string& exec_path,
+                      const std::string& file_path) noexcept {
+    LOG_INFO("Launching: {}{}", exec_path, file_path.empty() ? "" : " --open " + file_path);
+    recordAppLaunch();
+    std::vector<std::string> args{exec_path};
+    if (!file_path.empty()) { args.push_back("--open"); args.push_back(file_path); }
+    pid_t pid = spawnChild(std::move(args));
+    if (pid > 0) {
         // Parent: track child for crash detection (cap at 64 to avoid unbounded growth)
         std::string display = std::filesystem::path(exec_path).filename().string();
         std::lock_guard<std::mutex> lk(g_child_pids_mtx);
@@ -821,6 +833,45 @@ void launchApp(const std::string& exec_path,
             g_child_pids.emplace(pid, std::move(display));
             g_child_launch_times.emplace(pid, std::time(nullptr));
         }
+    }
+}
+
+// Launch the user's enabled XDG autostart entries (~/.config/autostart, managed
+// by Settings → Startup Items) once per compositor session: a marker newer
+// than the compositor's socket means this session already ran them, so an
+// xshell restart doesn't launch everything twice. Not tracked for crash
+// notifications — autostart helpers often exit on purpose.
+static void runAutostart() {
+    const char* home = std::getenv("HOME");
+    if (!home) return;
+    std::string marker = std::string("/tmp/freebsdx-autostart.") + std::to_string(getuid());
+    struct stat sock_st{}, mark_st{};
+    if (::stat("/tmp/freebsdx.sock", &sock_st) == 0 && ::lstat(marker.c_str(), &mark_st) == 0 &&
+        S_ISREG(mark_st.st_mode) && mark_st.st_uid == getuid() &&
+        mark_st.st_mtime >= sock_st.st_mtime) {
+        LOG_INFO("Autostart: already ran this session");
+        return;
+    }
+    int fd = ::open(marker.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd >= 0) { ::futimens(fd, nullptr); ::close(fd); }
+
+    std::error_code ec;
+    std::vector<std::filesystem::path> files;
+    for (const auto& de : std::filesystem::directory_iterator(fbx::shared::autostart::dirPath(home), ec))
+        if (fbx::shared::autostart::isEntryFile(de.path().filename().string()) && de.is_regular_file(ec))
+            files.push_back(de.path());
+    std::sort(files.begin(), files.end());
+    for (const auto& path : files) {
+        std::ifstream f(path);
+        std::stringstream body;
+        body << f.rdbuf();
+        fbx::shared::autostart::Entry e;
+        if (!fbx::shared::autostart::parse(body.str(), e) || !fbx::shared::autostart::shouldLaunch(e))
+            continue;
+        std::string cmd = fbx::shared::autostart::commandLine(e.exec);
+        if (cmd.empty()) continue;
+        LOG_INFO("Autostart: {} ({})", e.name.empty() ? path.filename().string() : e.name, cmd);
+        spawnChild({"/bin/sh", "-c", cmd});
     }
 }
 
@@ -9557,6 +9608,7 @@ int main() {
     {
         g_shell_xbus = &xbus;
         LOG_INFO("Shell connected to XBus. Starting status polling...");
+        runAutostart();   // the session's compositor is up: launch login items
         loadRecentFiles();
         loadRecentQueries();
         loadClipSlots();
