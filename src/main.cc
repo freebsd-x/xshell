@@ -765,22 +765,32 @@ static std::string fmtBps(uint64_t bps) noexcept {
     return std::format("{}B/s", bps);
 }
 
+// Bundle executable → manifest identifier, filled at app discovery. Passed to
+// the app as XAPP_ID so it announces itself to the compositor (per-app
+// permissions are keyed by it).
+static std::map<std::string, std::string> g_app_ids;
+
 // Environment for anything the shell launches: ours + the user's overrides
-// (Settings → Environment) + the two session vars, which always win.
-static std::vector<std::string> childEnv() {
+// (Settings → Environment) + the two session vars and `session_extra`
+// ("KEY=value"), which always win. XAPP_ID is never inherited.
+static std::vector<std::string> childEnv(const std::vector<std::string>& session_extra = {}) {
     std::vector<std::string> env_strs;
     auto overridden = [](std::string_view kv, std::string_view key) {
         return kv.size() > key.size() && kv.substr(0, key.size()) == key && kv[key.size()] == '=';
     };
-    std::vector<std::string> keys{"WAYLAND_DISPLAY", "XBUS_SOCKET"};
+    std::vector<std::string> keys{"WAYLAND_DISPLAY", "XBUS_SOCKET", "XAPP_ID"};
     std::vector<std::string> extra{"WAYLAND_DISPLAY=wayland-0",
                                    "XBUS_SOCKET=/tmp/freebsdx.sock"};
+    for (const auto& kv : session_extra) {
+        keys.push_back(kv.substr(0, kv.find('=')));
+        extra.push_back(kv);
+    }
     if (const char* home = std::getenv("HOME")) {
         std::ifstream f(fbx::shared::userenv::filePath(home));
         std::stringstream body;
         body << f.rdbuf();
         for (auto& v : fbx::shared::userenv::parse(body.str())) {
-            if (v.key == "WAYLAND_DISPLAY" || v.key == "XBUS_SOCKET") continue;
+            if (v.key == "WAYLAND_DISPLAY" || v.key == "XBUS_SOCKET" || v.key == "XAPP_ID") continue;
             keys.push_back(v.key);
             extra.push_back(v.key + "=" + v.value);
         }
@@ -797,8 +807,9 @@ static std::vector<std::string> childEnv() {
 // fork + execve `args` with childEnv(). argv/envp are built before fork: the
 // child of a threaded process may only call async-signal-safe functions, so no
 // setenv/malloc after fork. Returns the pid, or -1.
-static pid_t spawnChild(std::vector<std::string> args) {
-    std::vector<std::string> env_strs = childEnv();
+static pid_t spawnChild(std::vector<std::string> args,
+                        const std::vector<std::string>& session_extra = {}) {
+    std::vector<std::string> env_strs = childEnv(session_extra);
     std::vector<char*> envp, argv;
     for (auto& e : env_strs) envp.push_back(e.data());
     envp.push_back(nullptr);
@@ -824,7 +835,10 @@ void launchApp(const std::string& exec_path,
     recordAppLaunch();
     std::vector<std::string> args{exec_path};
     if (!file_path.empty()) { args.push_back("--open"); args.push_back(file_path); }
-    pid_t pid = spawnChild(std::move(args));
+    std::vector<std::string> session_extra;
+    if (auto it = g_app_ids.find(exec_path); it != g_app_ids.end())
+        session_extra.push_back("XAPP_ID=" + it->second);
+    pid_t pid = spawnChild(std::move(args), session_extra);
     if (pid > 0) {
         // Parent: track child for crash detection (cap at 64 to avoid unbounded growth)
         std::string display = std::filesystem::path(exec_path).filename().string();
@@ -1285,6 +1299,8 @@ int main() {
     AppDiscoveryService discovery;
     auto apps = discovery.discoverApps("./apps");
     if (apps.empty()) apps = discovery.discoverApps("../apps");
+    for (const auto& a : apps)
+        if (!a.identifier.empty()) g_app_ids[a.executable_path] = a.identifier;
 
     // Launchpad — WrapRowWidget gives a true icon grid.
     std::vector<std::shared_ptr<Widget>> app_icons;
