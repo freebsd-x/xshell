@@ -6,6 +6,7 @@
 #include "xshell/app_discovery.h"
 #include "xrender/font_manager.h"
 #include "shared/logger.h"
+#include "shared/user_env.h"
 #include "shell_helpers.h"
 #include "shell_query.h"    // MathParser, quickMathEval, searchFiles (carved out)
 #include "shell_panels.h"   // ShellContext + buildXPanel() builders (Phase 2)
@@ -15,6 +16,7 @@
 #include <set>
 #include <array>
 #include <fstream>
+#include <sstream>
 #include <algorithm>
 #include <csignal>
 #include <unistd.h>
@@ -32,6 +34,8 @@
 #include <map>
 #include <mutex>
 #include <sys/sysctl.h>
+
+extern "C" char** environ;  // POSIX doesn't guarantee a header declares it
 
 using namespace fbx::xkit;
 using namespace fbx::xshell;
@@ -762,21 +766,52 @@ void launchApp(const std::string& exec_path,
                       const std::string& file_path) noexcept {
     LOG_INFO("Launching: {}{}", exec_path, file_path.empty() ? "" : " --open " + file_path);
     recordAppLaunch();
+
+    // Build argv/envp before fork: the child of a threaded process may only
+    // call async-signal-safe functions, so no setenv/malloc after fork. The
+    // environment is ours + the user's overrides (Settings → Environment) +
+    // the two session vars, which always win.
+    std::vector<std::string> env_strs;
+    auto overridden = [](std::string_view kv, std::string_view key) {
+        return kv.size() > key.size() && kv.substr(0, key.size()) == key && kv[key.size()] == '=';
+    };
+    std::vector<std::string> keys{"WAYLAND_DISPLAY", "XBUS_SOCKET"};
+    std::vector<std::string> extra{"WAYLAND_DISPLAY=wayland-0",
+                                   "XBUS_SOCKET=/tmp/freebsdx.sock"};
+    if (const char* home = std::getenv("HOME")) {
+        std::ifstream f(fbx::shared::userenv::filePath(home));
+        std::stringstream body;
+        body << f.rdbuf();
+        for (auto& v : fbx::shared::userenv::parse(body.str())) {
+            if (v.key == "WAYLAND_DISPLAY" || v.key == "XBUS_SOCKET") continue;
+            keys.push_back(v.key);
+            extra.push_back(v.key + "=" + v.value);
+        }
+    }
+    for (char** e = environ; e && *e; ++e) {
+        bool skip = false;
+        for (const auto& k : keys) skip = skip || overridden(*e, k);
+        if (!skip) env_strs.emplace_back(*e);
+    }
+    env_strs.insert(env_strs.end(), extra.begin(), extra.end());
+    std::vector<char*> envp;
+    for (auto& s : env_strs) envp.push_back(s.data());
+    envp.push_back(nullptr);
+    std::vector<char*> argv{const_cast<char*>(exec_path.c_str())};
+    if (!file_path.empty()) {
+        argv.push_back(const_cast<char*>("--open"));
+        argv.push_back(const_cast<char*>(file_path.c_str()));
+    }
+    argv.push_back(nullptr);
+
     pid_t pid = fork();
     if (pid == 0) {
         // Close every FD above stderr so the child starts with a clean table.
         // The app will open its own XBus socket and Vulkan device from scratch.
         closefrom(STDERR_FILENO + 1);
-
-        setenv("WAYLAND_DISPLAY", "wayland-0", 1);
-        setenv("XBUS_SOCKET", "/tmp/freebsdx.sock", 1);  // real socket (was a stale hyphenated typo)
-        if (file_path.empty()) {
-            execl(exec_path.c_str(), exec_path.c_str(), nullptr);
-        } else {
-            execl(exec_path.c_str(), exec_path.c_str(),
-                  "--open", file_path.c_str(), nullptr);
-        }
-        std::cerr << "[xshell] execl failed: " << exec_path << "\n";
+        execve(exec_path.c_str(), argv.data(), envp.data());
+        static const char kMsg[] = "[xshell] execve failed\n";
+        (void)!write(STDERR_FILENO, kMsg, sizeof(kMsg) - 1);
         _exit(1);
     } else if (pid > 0) {
         // Parent: track child for crash detection (cap at 64 to avoid unbounded growth)
