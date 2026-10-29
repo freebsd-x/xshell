@@ -829,8 +829,21 @@ static pid_t spawnChild(std::vector<std::string> args,
     return pid;
 }
 
-void launchApp(const std::string& exec_path,
+void launchApp(const std::string& exec_or_id,
                       const std::string& file_path) noexcept {
+    // Callers that open a file pass the MIME handler's app identifier
+    // ("com.freebsdx.imageviewer"), not an executable path: resolve it to the
+    // bundle's binary (identifiers never contain '/'). Without this,
+    // opening files from search / recent files / screenshots never worked.
+    std::string exec_path = exec_or_id;
+    if (exec_path.find('/') == std::string::npos) {
+        for (const auto& [path, id] : g_app_ids)
+            if (id == exec_path) { exec_path = path; break; }
+        if (exec_path.find('/') == std::string::npos) {
+            LOG_WARN("Launching: no installed app '{}'", exec_or_id);
+            return;
+        }
+    }
     LOG_INFO("Launching: {}{}", exec_path, file_path.empty() ? "" : " --open " + file_path);
     recordAppLaunch();
     std::vector<std::string> args{exec_path};
@@ -5797,16 +5810,26 @@ int main() {
                             auto done_lbl = std::make_shared<TextWidget>(
                                 std::format("Done  {:.1f} MB", mb), 10.0f);
                             done_lbl->setColor({0.40f, 0.75f, 0.45f, 1.0f});
-                            uint32_t eid = e.id_;
+                            // Open ~/Downloads/<file> with its default app (the
+                            // shell launches apps; the compositor can't).
+                            std::string fname(e.filename_, strnlen(e.filename_, sizeof(e.filename_)));
                             auto open_btn = std::make_shared<ButtonWidget>("Open",
-                                [eid]() {
-                                    if (!g_shell_xbus) return;
-                                    DownloadFileRequest req{};
-                                    req.id_ = eid;
-                                    g_shell_xbus->Call("com.freebsdx.Downloads",
-                                        static_cast<uint32_t>(DownloadOpcode::OpenFile),
-                                        {reinterpret_cast<const uint8_t*>(&req), sizeof(req)},
-                                        nullptr);
+                                [fname]() {
+                                    const char* home = std::getenv("HOME");
+                                    if (!g_shell_xbus || !home || fname.empty() ||
+                                        fname.find('/') != std::string::npos) return;
+                                    std::string p = std::string(home) + "/Downloads/" + fname;
+                                    MimeQueryRequest qr{};
+                                    std::strncpy(qr.path_, p.c_str(), sizeof(qr.path_) - 1);
+                                    qr.is_path_ = 1;
+                                    g_shell_xbus->Call("com.freebsdx.MIME",
+                                        static_cast<uint32_t>(MimeOpcode::QueryHandler),
+                                        {reinterpret_cast<const uint8_t*>(&qr), sizeof(qr)},
+                                        [p](const XBusMessage& resp) {
+                                            MimeHandlerInfo info{};
+                                            std::memcpy(&info, resp.payload_, sizeof(info));
+                                            if (info.app_id_[0]) launchApp(info.app_id_, p);
+                                        });
                                 });
                             open_btn->setFixedSize(48, 22);
                             auto done_row = std::make_shared<FlexRow>(
