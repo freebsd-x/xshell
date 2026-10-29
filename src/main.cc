@@ -2065,7 +2065,9 @@ int main() {
         [](uint32_t v) { return std::format("{}%", v); },
         [](const TrueToneState& st) { return st.enabled_ != 0; },
         [](const TrueToneState& st) { return st.strength_; },
-        [](const TrueToneState& st) { return std::format("ambient {}K", st.ambient_k_); });
+        [](const TrueToneState& st) {
+            return st.ambient_k_ ? std::format("ambient {}K", st.ambient_k_) : std::string("no light sensor");
+        });
     auto& ttone_sw              = ttone.sw;
     auto& ttone_strength_slider = ttone.slider;
     auto& ttone_strength_lbl    = ttone.value_lbl;
