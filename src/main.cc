@@ -829,6 +829,30 @@ static pid_t spawnChild(std::vector<std::string> args,
     return pid;
 }
 
+// Apps that load a file sent to them as a LaunchWithFile broadcast into
+// their open window. Opening a file in one of these while it runs reuses that
+// window instead of starting a second copy. (Other apps open a window per file.)
+static bool opensInRunningWindow(const std::string& app_id) {
+    return app_id == "com.freebsdx.imageviewer" || app_id == "com.freebsdx.videoplayer" ||
+           app_id == "com.freebsdx.browser";
+}
+
+// Is an instance of this executable, launched by the shell, still alive?
+static bool appRunning(const std::string& exec_path) {
+    const std::string name = std::filesystem::path(exec_path).filename().string();
+    std::lock_guard<std::mutex> lk(g_child_pids_mtx);
+    for (const auto& [pid, display] : g_child_pids)
+        if (display == name && ::kill(pid, 0) == 0) return true;
+    return false;
+}
+
+// Would a LaunchWithFile for this app and file be taken by its open window?
+static bool runningWindowTakesFile(const std::string& exec_path, const std::string& file_path) {
+    auto it = g_app_ids.find(exec_path);
+    return it != g_app_ids.end() && opensInRunningWindow(it->second) && !file_path.empty() &&
+           file_path.size() < sizeof(ShellLaunchRequest::file_path_) && appRunning(exec_path);
+}
+
 void launchApp(const std::string& exec_or_id,
                       const std::string& file_path) noexcept {
     // Callers that open a file pass the MIME handler's app identifier
@@ -843,6 +867,17 @@ void launchApp(const std::string& exec_or_id,
             LOG_WARN("Launching: no installed app '{}'", exec_or_id);
             return;
         }
+    }
+    if (g_shell_xbus && runningWindowTakesFile(exec_path, file_path)) {
+        // The running window loads it (the broadcast also reaches this shell,
+        // whose LaunchWithFile handler sees the same and doesn't relaunch).
+        ShellLaunchRequest req{};
+        std::strncpy(req.app_id_, g_app_ids[exec_path].c_str(), sizeof(req.app_id_) - 1);
+        std::strncpy(req.file_path_, file_path.c_str(), sizeof(req.file_path_) - 1);
+        LOG_INFO("Opening {} in the running {}", file_path, req.app_id_);
+        g_shell_xbus->Call("com.freebsdx.Shell", static_cast<uint32_t>(ShellOpcode::LaunchWithFile),
+                           {reinterpret_cast<const uint8_t*>(&req), sizeof(req)}, nullptr);
+        return;
     }
     LOG_INFO("Launching: {}{}", exec_path, file_path.empty() ? "" : " --open " + file_path);
     recordAppLaunch();
@@ -1314,7 +1349,10 @@ buildEnableDisableTile(const char* disabled_text, Color disabled_color, Color en
 
 
 int main() {
-    signal(SIGCHLD, SIG_IGN);
+    // Children are reaped by waitpid() on the main loop's tick (crash
+    // notifications, screen time, running-app checks). SIG_IGN would make the
+    // kernel auto-reap them, so waitpid() never saw an exit.
+    signal(SIGCHLD, SIG_DFL);
     ShellContext ctx;
 
     Logger::init("xshell");
@@ -10991,13 +11029,7 @@ int main() {
                 }
             });
         weather_btn->onClick([]() {
-            if (fork() == 0) {
-                setenv("XBUS_SOCKET", "/tmp/freebsdx.sock", 1);
-                if (access("./out/weather", X_OK) == 0)
-                    execl("./out/weather", "weather", nullptr);
-                execlp("weather", "weather", nullptr);
-                exit(1);
-            }
+            launchApp("com.freebsdx.weather");
         });
 
         // ── Clipboard history: load initial entries ──────────────────────────
@@ -11682,7 +11714,9 @@ int main() {
                     std::string file_path(req.file_path_);
                     for (const auto& app : apps) {
                         if (app.identifier == app_id) {
-                            launchApp(app.executable_path, file_path);
+                            // A running viewer takes this broadcast itself.
+                            if (!runningWindowTakesFile(app.executable_path, file_path))
+                                launchApp(app.executable_path, file_path);
                             // Record in recent files
                             if (!file_path.empty()) {
                                 std::string fname = file_path.substr(
