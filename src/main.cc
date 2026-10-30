@@ -227,6 +227,10 @@ static bool nsSchedActive(int hour) noexcept {
 static std::mutex               g_child_pids_mtx;
 static std::map<pid_t, std::string> g_child_pids; // pid → display name (capped at 64)
 
+// ── Screen Time "Time's up" card ──────────────────────────────────────────────
+// Set once the card is built; the AppTimeLimit LimitReached broadcast shows it.
+static std::function<void(const AppTimeLimitReached&)> g_show_times_up;
+
 // ── Startup apps ──────────────────────────────────────────────────────────────
 static std::set<std::string> g_startup_apps; // app identifiers to auto-launch at login
 
@@ -8969,6 +8973,9 @@ int main() {
         fc_btn_row
     });
     fc_panel_col->setPadding(4);
+    // Stretch bounds the rows to the panel's width: without it the button
+    // row's flexible spacer grew to 100000 px, pushing Cancel/Open off-screen.
+    fc_panel_col->setCrossAxisAlignment(CrossAxisAlignment::Stretch);
 
     auto fc_overlay = std::make_shared<ContainerWidget>(fc_panel_col);
     fc_overlay->setBackgroundColor({0.13f, 0.14f, 0.20f, 0.97f});
@@ -8977,6 +8984,55 @@ int main() {
 
     // Store back-pointer so ok/cancel buttons can hide the panel
     *fc_overlay_ptr = fc_overlay;
+
+    // ── Screen Time "Time's up" card ─────────────────────────────────────────
+    // Shown when an app reaches its daily limit (AppTimeLimit LimitReached):
+    // close the app now, or allow 15 more minutes today.
+    auto tu_app_id = std::make_shared<std::string>();
+    auto tu_title  = std::make_shared<TextWidget>("Time's up", 17.0f);
+    tu_title->setColor({1.0f, 1.0f, 1.0f, 1.0f});
+    auto tu_msg = std::make_shared<TextWidget>("", 12.0f);
+    tu_msg->setColor({0.75f, 0.78f, 0.86f, 1.0f});
+    auto tu_overlay_ptr = std::make_shared<std::shared_ptr<Widget>>(nullptr);
+    auto tu_send = [tu_app_id, tu_overlay_ptr](AppTimeLimitOpcode op, uint32_t minutes) {
+        if (*tu_overlay_ptr) (*tu_overlay_ptr)->setVisibility(false);
+        if (!g_shell_xbus || tu_app_id->empty()) return;
+        AppTimeLimitAppRequest req{};
+        std::strncpy(req.app_id_, tu_app_id->c_str(), sizeof(req.app_id_) - 1);
+        req.minutes_ = minutes;
+        g_shell_xbus->Call("com.freebsdx.AppTimeLimit", static_cast<uint32_t>(op),
+                           {reinterpret_cast<const uint8_t*>(&req), sizeof(req)}, nullptr);
+    };
+    auto tu_more_btn = std::make_shared<ButtonWidget>("15 more minutes",
+        [tu_send]() { tu_send(AppTimeLimitOpcode::Extend, 15); });
+    auto tu_close_btn = std::make_shared<ButtonWidget>("Close app",
+        [tu_send]() { tu_send(AppTimeLimitOpcode::CloseApp, 0); });
+    auto tu_btn_row = std::make_shared<FlexRow>(std::vector<std::shared_ptr<Widget>>{
+        std::make_shared<Spacer>(1, 1, true),
+        tu_more_btn, std::make_shared<Spacer>(10, 1), tu_close_btn
+    });
+    auto tu_col = std::make_shared<FlexColumn>(std::vector<std::shared_ptr<Widget>>{
+        tu_title, std::make_shared<Spacer>(1, 8), tu_msg, std::make_shared<Spacer>(1, 16), tu_btn_row
+    });
+    tu_col->setPadding(16);
+    // Bound the rows to the card's width; otherwise the button row's flexible
+    // spacer grows to the column's unbounded 100000 px and the buttons land
+    // off-screen.
+    tu_col->setCrossAxisAlignment(CrossAxisAlignment::Stretch);
+    auto tu_overlay = std::make_shared<ContainerWidget>(tu_col);
+    tu_overlay->setBackgroundColor({0.13f, 0.14f, 0.20f, 0.97f});
+    tu_overlay->setFixedSize(420, 150);
+    tu_overlay->setVisibility(false);
+    *tu_overlay_ptr = tu_overlay;
+    g_show_times_up = [tu_app_id, tu_msg, tu_overlay](const AppTimeLimitReached& r) {
+        char id[sizeof(r.app_id_) + 1]{}, name[sizeof(r.app_name_) + 1]{};
+        std::memcpy(id, r.app_id_, sizeof(r.app_id_));
+        std::memcpy(name, r.app_name_, sizeof(r.app_name_));
+        *tu_app_id = id;
+        tu_msg->setText(std::string(name[0] ? name : id) + " has reached today's " +
+                        std::to_string(r.limit_minutes_) + "-minute limit.");
+        tu_overlay->setVisibility(true);
+    };
 
     // fc_save_field only visible in save mode; sel_w only in open mode
     fc_save_field->setVisibility(false);
@@ -9479,7 +9535,7 @@ int main() {
     // The slot stays wired to the Wallpaper service calls below (harmless no-ops on
     // a detached widget) so re-enabling shell-side rendering later is a one-liner.
     auto root_overlay = std::make_shared<StackWidget>(std::vector<std::shared_ptr<Widget>>{
-        wallpaper, desktop, start_menu, search_portal, qs_panel, action_center, switcher_panel, vkb_anchor, fc_overlay, ch_overlay, cp_overlay, shortcuts_overlay, cal_popover, disp_overlay, osd_overlay, notes_overlay
+        wallpaper, desktop, start_menu, search_portal, qs_panel, action_center, switcher_panel, vkb_anchor, fc_overlay, ch_overlay, cp_overlay, shortcuts_overlay, cal_popover, disp_overlay, osd_overlay, notes_overlay, tu_overlay
     });
     root_overlay->setAlignment(Alignment::Center);
 
@@ -13119,6 +13175,13 @@ int main() {
             if (std::strcmp(msg.service_name_, "com.freebsdx.AppTimeLimit") == 0 &&
                 msg.opcode_ == static_cast<uint32_t>(AppTimeLimitOpcode::LimitsChanged)) {
                 if (rebuild_applimit && *rebuild_applimit) (*rebuild_applimit)();
+                return;
+            }
+            if (std::strcmp(msg.service_name_, "com.freebsdx.AppTimeLimit") == 0 &&
+                msg.opcode_ == static_cast<uint32_t>(AppTimeLimitOpcode::LimitReached)) {
+                AppTimeLimitReached r{};
+                std::memcpy(&r, msg.payload_, sizeof(r));
+                if (g_show_times_up) g_show_times_up(r);
                 return;
             }
             if (std::strcmp(msg.service_name_, "com.freebsdx.BatteryHealth") == 0 &&
