@@ -1356,6 +1356,111 @@ buildEnableDisableTile(const char* disabled_text, Color disabled_color, Color en
 
 
 
+
+// ── Theme-aware taskbar ──────────────────────────────────────────────────────
+// The taskbar follows the theme: dark glass with white text in the dark theme,
+// light glass with black text in the light one. Rather than recolour each of
+// its (partly rebuilt-at-runtime) items by hand, the neutral colours inside it
+// — white/grey text and fills — are mirrored for the light theme; semantic
+// colours (a red battery warning, a green toggle) are left alone. Each
+// widget's design (dark-theme) colour is remembered so switching back is exact.
+static bool g_shell_dark = true;   // follows the Theme service (startup query + ThemeChanged)
+
+namespace taskbar_theme {
+
+// A widget's design (dark-theme) colours, and what this last set them to: a
+// colour that no longer matches was changed by the shell itself (a battery
+// label turning red), so it becomes the new design colour.
+struct Design {
+    Color text{}, text_set{}; bool has_text = false, text_applied = false;
+    Color bg{},   bg_set{};   bool has_bg = false,   bg_applied = false;
+};
+inline bool same(const Color& a, const Color& b) {
+    return a.r == b.r && a.g == b.g && a.b == b.b && a.a == b.a;
+}
+using DesignMap = std::map<std::weak_ptr<Widget>, Design, std::owner_less<std::weak_ptr<Widget>>>;
+
+inline bool neutral(const Color& c) {
+    return std::abs(c.r - c.g) < 0.08f && std::abs(c.g - c.b) < 0.08f;
+}
+// Dark-theme design colour → the light theme's: neutrals mirror (white → near
+// black, light grey → dark grey, near-black fill → near-white); others stay.
+inline Color forTheme(const Color& c, bool dark) {
+    if (dark || !neutral(c)) return c;
+    auto m = [](float v) { return std::clamp(1.04f - v, 0.0f, 1.0f); };
+    return {m(c.r), m(c.g), m(c.b), c.a};
+}
+
+inline void apply(const std::shared_ptr<Widget>& w, bool dark, DesignMap& design) {
+    if (!w) return;
+    auto it = design.find(w);
+    if (it == design.end()) {
+        Design d;
+        if (auto t = std::dynamic_pointer_cast<TextWidget>(w)) {
+            d.has_text = true;
+            d.text = t->hasColor() ? t->color() : Color{1.0f, 1.0f, 1.0f, 1.0f};
+        }
+        if (w->hasBackground()) { d.has_bg = true; d.bg = w->backgroundColor(); }
+        it = design.emplace(w, d).first;
+    }
+    Design& d = it->second;
+    if (d.has_text) {
+        auto t = std::static_pointer_cast<TextWidget>(w);
+        if (d.text_applied && !same(t->color(), d.text_set)) d.text = t->color();
+        d.text_set = forTheme(d.text, dark);
+        d.text_applied = true;
+        t->setColor(d.text_set);
+    }
+    if (!d.has_bg && w->hasBackground()) { d.has_bg = true; d.bg = w->backgroundColor(); }
+    if (d.has_bg) {
+        if (d.bg_applied && !same(w->backgroundColor(), d.bg_set)) d.bg = w->backgroundColor();
+        d.bg_set = forTheme(d.bg, dark);
+        d.bg_applied = true;
+        w->setBackgroundColor(d.bg_set);
+    }
+
+    if (auto row = std::dynamic_pointer_cast<FlexRow>(w))
+        for (const auto& c : row->children()) apply(c, dark, design);
+    else if (auto col = std::dynamic_pointer_cast<FlexColumn>(w))
+        for (const auto& c : col->children()) apply(c, dark, design);
+    else if (auto btn = std::dynamic_pointer_cast<ButtonWidget>(w))
+        apply(btn->child(), dark, design);
+}
+
+inline void prune(DesignMap& design) {   // rebuilt items leave expired entries
+    if (design.size() < 512) return;
+    for (auto it = design.begin(); it != design.end();)
+        it = it->first.expired() ? design.erase(it) : std::next(it);
+}
+
+// The FreeBSD-X logo — an X of two round-capped strokes (the geometry of
+// Branding/logo_x.svg) — rasterised in one colour, anti-aliased.
+inline std::shared_ptr<ImageWidget> logo(uint8_t v) {
+    constexpr int N = 48;
+    constexpr float a = N * 0.20f, b = N * 0.80f, half = N * 0.06f;   // stroke 12/100
+    std::vector<uint8_t> px(N * N * 4, 0);
+    auto segDist = [](float x, float y, float x0, float y0, float x1, float y1) {
+        float dx = x1 - x0, dy = y1 - y0;
+        float t = std::clamp(((x - x0) * dx + (y - y0) * dy) / (dx * dx + dy * dy), 0.0f, 1.0f);
+        float ex = x - (x0 + t * dx), ey = y - (y0 + t * dy);
+        return std::sqrt(ex * ex + ey * ey);
+    };
+    for (int y = 0; y < N; ++y)
+        for (int x = 0; x < N; ++x) {
+            float fx = x + 0.5f, fy = y + 0.5f;
+            float d = std::min(segDist(fx, fy, a, a, b, b), segDist(fx, fy, b, a, a, b));
+            float cov = std::clamp(half + 0.5f - d, 0.0f, 1.0f);
+            uint8_t* p = &px[(y * N + x) * 4];
+            p[0] = p[1] = p[2] = v;
+            p[3] = static_cast<uint8_t>(cov * 255.0f + 0.5f);
+        }
+    auto img = std::make_shared<ImageWidget>(std::move(px), N, N);
+    img->setFixedSize(24, 24);
+    return img;
+}
+
+}  // namespace taskbar_theme
+
 int main() {
     // Children are reaped by waitpid() on the main loop's tick (crash
     // notifications, screen time, running-app checks). SIG_IGN would make the
@@ -1418,19 +1523,18 @@ int main() {
     *close_launcher = [start_menu]() { start_menu->setVisibility(false); };
 
     // Taskbar
-    auto logo   = std::make_shared<ImageWidget>("core/shell/Resources/Branding/logo_x.svg");
-    logo->setFixedSize(24, 24);
-    // Just the X logo — the "FREEBSD-X" wordmark was removed to keep the start
-    // button compact.
+    // Just the X logo (the "FREEBSD-X" wordmark was removed to keep the start
+    // button compact): white on the dark-theme bar, black on the light one.
+    auto logo_on_dark  = taskbar_theme::logo(255);
+    auto logo_on_light = taskbar_theme::logo(20);
     auto start_row = std::make_shared<FlexRow>(std::vector<std::shared_ptr<Widget>>{
-        logo
+        logo_on_dark
     });
     start_row->setCrossAxisAlignment(CrossAxisAlignment::Center);
     auto start_btn = std::make_shared<ButtonWidget>(start_row,
         [&start_menu](){ start_menu->setVisibility(!start_menu->isVisible()); });
-    // Taskbar chrome is always dark; without an explicit background the button
-    // paints theme.surface (white in the light theme) and swallows the logo.
-    // Match the clock/weather buttons and stay transparent over the dark bar.
+    // Transparent over the bar (whose glass follows the theme); without an
+    // explicit background the button paints theme.surface over the logo.
     start_btn->setBackgroundColor({0.0f, 0.0f, 0.0f, 0.0f});
     // Square-ish box just wide enough for the 24px logo plus padding.
     start_btn->setFixedSize(48, 40);
@@ -9609,7 +9713,30 @@ int main() {
             notes_overlay, shortcuts_overlay, fc_overlay, pc_overlay, tu_overlay};
         auto grabbed = std::make_shared<bool>(false);
         auto search_was_open = std::make_shared<bool>(false);
-        XApplication::setOnFrame([kb_popups, grabbed, search_was_open, search_portal, search_input]() {
+        // Taskbar theme state: design colours of its items, and the theme last applied.
+        auto tb_design = std::make_shared<taskbar_theme::DesignMap>();
+        auto tb_applied_dark = std::make_shared<int>(-1);   // -1: not yet applied
+        XApplication::setOnFrame([kb_popups, grabbed, search_was_open, search_portal, search_input,
+                                  taskbar, start_row, logo_on_dark, logo_on_light,
+                                  tb_design, tb_applied_dark]() {
+            // The taskbar follows the theme. Re-applied every frame in the light
+            // theme (items such as window chips are rebuilt with dark-design
+            // colours), once on the switch back to dark.
+            const bool dark = g_shell_dark;
+            const bool switched = *tb_applied_dark != static_cast<int>(dark);
+            if (switched || !dark) {
+                for (const auto& item : taskbar->children()) taskbar_theme::apply(item, dark, *tb_design);
+                taskbar_theme::prune(*tb_design);
+            }
+            if (switched)   // the bar's own glass
+                taskbar->setBackgroundColor(dark ? Color{0.09f, 0.10f, 0.13f, 0.88f}
+                                                 : Color{0.96f, 0.96f, 0.97f, 0.88f});
+            if (switched) {
+                start_row->clearChildren();
+                start_row->addChild(dark ? logo_on_dark : logo_on_light);
+                *tb_applied_dark = static_cast<int>(dark);
+            }
+
             const bool want = std::any_of(kb_popups.begin(), kb_popups.end(),
                                           [](const auto& w) { return w && w->isVisible(); });
             if (want != *grabbed && g_shell_xbus) {
@@ -12089,6 +12216,7 @@ int main() {
 
             if (input->type_ == InputEventType::ThemeChanged) {
                 g_accent_idx = static_cast<uint32_t>(input->value_b_);
+                g_shell_dark = input->value_a_ != 0;
                 qs_dark_switch->setValue(input->value_a_ != 0);
             } else if (input->type_ == InputEventType::SearchToggle) {
                 search_portal->setVisibility(!search_portal->isVisible());
@@ -13570,6 +13698,7 @@ int main() {
                         ThemeState ts{};
                         std::memcpy(&ts, r.payload_, sizeof(ts));
                         g_accent_idx = ts.accent_idx_;
+                        g_shell_dark = ts.dark_mode_ != 0;
                         qs_dark_switch->setValue(ts.dark_mode_ != 0);
                     });
 
