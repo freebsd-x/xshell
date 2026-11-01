@@ -4679,7 +4679,10 @@ int main() {
 
     // ── Spotlight Search ──────────────────────────────────────────────────────
     // Input box
-    auto search_input = std::make_shared<TextInputWidget>("🔍  Search apps, files, settings…");
+    // A placeholder, not the field's text (it used to be the text: typing
+    // edited the hint and the search ran on the whole sentence).
+    auto search_input = std::make_shared<TextInputWidget>("");
+    search_input->setPlaceholder("🔍  Search apps, files, settings…");
 
     // Section headers
     auto make_sec_hdr = [](const std::string& title) {
@@ -9594,6 +9597,53 @@ int main() {
         wallpaper, desktop, start_menu, search_portal, qs_panel, action_center, switcher_panel, vkb_anchor, fc_overlay, ch_overlay, cp_overlay, shortcuts_overlay, cal_popover, disp_overlay, osd_overlay, notes_overlay, tu_overlay, pc_overlay
     });
     root_overlay->setAlignment(Alignment::Center);
+
+    // ── Keyboard: focus for the shell's popups, Esc to close, ↑/↓ in search ──
+    // While a popup that can be used from the keyboard is open, the shell asks
+    // the compositor for the keyboard (ShellOpcode::KeyboardGrab) — otherwise
+    // typing after Super+Space went to the app underneath. Opening search puts
+    // the cursor in its field.
+    {
+        const std::vector<std::shared_ptr<Widget>> kb_popups{
+            search_portal, start_menu, action_center, qs_panel, ch_overlay, cp_overlay,
+            notes_overlay, shortcuts_overlay, fc_overlay, pc_overlay, tu_overlay};
+        auto grabbed = std::make_shared<bool>(false);
+        auto search_was_open = std::make_shared<bool>(false);
+        XApplication::setOnFrame([kb_popups, grabbed, search_was_open, search_portal, search_input]() {
+            const bool want = std::any_of(kb_popups.begin(), kb_popups.end(),
+                                          [](const auto& w) { return w && w->isVisible(); });
+            if (want != *grabbed && g_shell_xbus) {
+                *grabbed = want;
+                uint32_t on = want ? 1u : 0u;
+                g_shell_xbus->Call("com.freebsdx.Shell", static_cast<uint32_t>(ShellOpcode::KeyboardGrab),
+                                   {reinterpret_cast<const uint8_t*>(&on), sizeof(on)}, nullptr);
+            }
+            const bool search_open = search_portal->isVisible();
+            if (search_open && !*search_was_open) (void)XApplication::focusWidget(search_input);
+            *search_was_open = search_open;
+        });
+        // Esc closes the topmost open popup (not the permission / Time's-up
+        // cards or the file chooser: those need an answer). In search, ↓ / ↑
+        // move through the results (Enter opens one).
+        const std::vector<std::shared_ptr<Widget>> esc_order{
+            shortcuts_overlay, notes_overlay, cp_overlay, ch_overlay, search_portal,
+            start_menu, action_center, qs_panel};
+        XApplication::setOnShortcut([esc_order, search_portal](const InputMessage& in) {
+            if (in.type_ != InputEventType::KeyPress || in.value_b_ == 0 || (in.modifiers_ & (2u | 4u | 8u)))
+                return false;
+            constexpr int kEsc = 1, kUp = 103, kDown = 108;
+            if (in.value_a_ == kEsc) {
+                for (const auto& w : esc_order)
+                    if (w && w->isVisible()) { w->setVisibility(false); return true; }
+                return false;
+            }
+            if ((in.value_a_ == kDown || in.value_a_ == kUp) && search_portal->isVisible()) {
+                XApplication::moveFocus(in.value_a_ == kDown);
+                return true;
+            }
+            return false;
+        });
+    }
 
     return XApplication::Run(root_overlay, "/tmp/freebsdx.sock", false, true,
         [clock_w, cpu_w, mem_w, net_btn, search_portal, action_center,

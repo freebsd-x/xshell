@@ -530,8 +530,10 @@ void buildEnvVarsPanel(ShellContext& ctx) {
     ctx.envvar_col      = std::make_shared<FlexColumn>();
 
     // "Set Var" form pinned at top of the AC card
-    auto envvar_key_input = std::make_shared<TextInputWidget>("KEY");
-    auto envvar_val_input = std::make_shared<TextInputWidget>("value");
+    auto envvar_key_input = std::make_shared<TextInputWidget>("");   // hints, not initial text
+    envvar_key_input->setPlaceholder("KEY");
+    auto envvar_val_input = std::make_shared<TextInputWidget>("");
+    envvar_val_input->setPlaceholder("value");
     envvar_key_input->setFixedSize(90, 26);
     envvar_val_input->setFixedSize(120, 26);
 
