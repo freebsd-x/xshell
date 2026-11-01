@@ -7847,13 +7847,16 @@ void buildA11yQuickPanel(ShellContext& ctx) {
             ? Color{0.20f, 0.45f, 0.85f, 1.0f} : Color{0.22f, 0.22f, 0.26f, 1.0f});
     };
 
+    // com.freebsdx.A11ySettings (persisted). These used to go to
+    // com.freebsdx.Accessibility, whose opcodes mean something else there
+    // (SetFeature = Unsubscribe), so the buttons never did anything.
     auto a11y_send = [](uint32_t feature, uint32_t enabled) {
         if (!g_shell_xbus) return;
-        A11ySetRequest req{};
-        req.feature_ = feature;
+        using O = AccessibilitySettingsOpcode;
+        const O op = feature == 0 ? O::SetScreenReader : feature == 1 ? O::SetHighContrast : O::SetMagnifier;
+        AccessibilityToggleRequest req{};
         req.enabled_ = enabled;
-        g_shell_xbus->Call("com.freebsdx.Accessibility",
-            static_cast<uint32_t>(A11yOpcode::SetFeature),
+        g_shell_xbus->Call("com.freebsdx.A11ySettings", static_cast<uint32_t>(op),
             {reinterpret_cast<const uint8_t*>(&req), sizeof(req)}, nullptr);
     };
 

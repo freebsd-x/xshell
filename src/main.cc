@@ -2515,7 +2515,7 @@ int main() {
         *a11y_cfg = cfg;
         std::vector<uint8_t> buf(sizeof(cfg));
         std::memcpy(buf.data(), &cfg, sizeof(cfg));
-        g_shell_xbus->Call("com.freebsdx.Accessibility",
+        g_shell_xbus->Call("com.freebsdx.A11yPanel",
             static_cast<uint32_t>(AccessibilityPanelOpcode::SetSettings), buf, nullptr);
     };
 
@@ -10186,12 +10186,15 @@ int main() {
                 std::memcpy(&st, r.payload_, sizeof(st));
                 update_sysinfo_ui(st);
             });
-        // Initial accessibility state
-        xbus.Call("com.freebsdx.Accessibility",
-            static_cast<uint32_t>(A11yOpcode::GetState), {},
+        // Initial accessibility state (com.freebsdx.A11ySettings — the
+        // Accessibility service's GetState opcode is its Subscribe).
+        xbus.Call("com.freebsdx.A11ySettings",
+            static_cast<uint32_t>(AccessibilitySettingsOpcode::GetSettings), {},
             [update_a11y_ui_b](const XBusMessage& r) {
+                AccessibilityQuickSettings qs{};
+                std::memcpy(&qs, r.payload_, sizeof(qs));
                 A11yState st{};
-                std::memcpy(&st, r.payload_, sizeof(st));
+                st.reader_ = qs.screen_reader_; st.contrast_ = qs.high_contrast_; st.magnify_ = qs.magnifier_;
                 update_a11y_ui_b(st);
             });
         // Initial proxy config
@@ -10478,7 +10481,7 @@ int main() {
         // Initial system log (all levels)
         if (rebuild_slog && *rebuild_slog) (*rebuild_slog)();
         // Initial accessibility settings
-        xbus.Call("com.freebsdx.Accessibility",
+        xbus.Call("com.freebsdx.A11yPanel",
             static_cast<uint32_t>(AccessibilityPanelOpcode::GetSettings), {},
             [update_a11y_ui_c](const XBusMessage& r) {
                 AccessibilitySettings cfg{};
@@ -12787,11 +12790,16 @@ int main() {
                 return;
             }
 
-            // Accessibility feature toggled externally (e.g. keyboard shortcut)
-            if (std::strcmp(msg.service_name_, "com.freebsdx.Accessibility") == 0 &&
-                msg.opcode_ == static_cast<uint32_t>(A11yOpcode::StateChanged)) {
+            // Accessibility settings changed (here, in Settings, or by a shortcut).
+            // (Not com.freebsdx.Accessibility's 0x03 — that's its Announce
+            // broadcast, which used to be read as a state change and flipped
+            // these buttons with every spoken announcement.)
+            if (std::strcmp(msg.service_name_, "com.freebsdx.A11ySettings") == 0 &&
+                msg.opcode_ == static_cast<uint32_t>(AccessibilitySettingsOpcode::SettingsChanged)) {
+                AccessibilityQuickSettings qs{};
+                std::memcpy(&qs, msg.payload_, sizeof(qs));
                 A11yState st{};
-                std::memcpy(&st, msg.payload_, sizeof(st));
+                st.reader_ = qs.screen_reader_; st.contrast_ = qs.high_contrast_; st.magnify_ = qs.magnifier_;
                 update_a11y_ui_b(st);
                 return;
             }
@@ -13046,7 +13054,7 @@ int main() {
             }
 
             // Accessibility settings changed remotely
-            if (std::strcmp(msg.service_name_, "com.freebsdx.Accessibility") == 0 &&
+            if (std::strcmp(msg.service_name_, "com.freebsdx.A11yPanel") == 0 &&
                 msg.opcode_ == static_cast<uint32_t>(AccessibilityPanelOpcode::SettingsChanged)) {
                 AccessibilitySettings cfg{};
                 std::memcpy(&cfg, msg.payload_, sizeof(cfg));
