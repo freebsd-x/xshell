@@ -231,6 +231,10 @@ static std::map<pid_t, std::string> g_child_pids; // pid → display name (cappe
 // Set once the card is built; the AppTimeLimit LimitReached broadcast shows it.
 static std::function<void(const AppTimeLimitReached&)> g_show_times_up;
 
+// ── First-use permission card ─────────────────────────────────────────────────
+// Set once the card is built; the AppSandbox ConsentRequested broadcast shows it.
+static std::function<void(const AppSandboxConsentRequest&)> g_show_consent;
+
 // ── Startup apps ──────────────────────────────────────────────────────────────
 static std::set<std::string> g_startup_apps; // app identifiers to auto-launch at login
 
@@ -9024,6 +9028,58 @@ int main() {
     tu_overlay->setFixedSize(420, 150);
     tu_overlay->setVisibility(false);
     *tu_overlay_ptr = tu_overlay;
+
+    // ── First-use permission card ────────────────────────────────────────────
+    // A sandboxed app asked for the camera / microphone / screen for the first
+    // time; its request waits until the user answers here (SetPermission).
+    auto pc_app_id = std::make_shared<std::string>();
+    auto pc_perm   = std::make_shared<uint32_t>(0);
+    auto pc_title  = std::make_shared<TextWidget>("", 16.0f);
+    pc_title->setColor({1.0f, 1.0f, 1.0f, 1.0f});
+    auto pc_msg = std::make_shared<TextWidget>("", 12.0f);
+    pc_msg->setColor({0.75f, 0.78f, 0.86f, 1.0f});
+    auto pc_overlay_ptr = std::make_shared<std::shared_ptr<Widget>>(nullptr);
+    auto pc_answer = [pc_app_id, pc_perm, pc_overlay_ptr](bool allow) {
+        if (*pc_overlay_ptr) (*pc_overlay_ptr)->setVisibility(false);
+        if (!g_shell_xbus || pc_app_id->empty()) return;
+        AppSandboxPermRequest req{};
+        std::strncpy(req.identifier_, pc_app_id->c_str(), sizeof(req.identifier_) - 1);
+        req.permission_ = *pc_perm;
+        req.allowed_    = allow ? 1u : 0u;
+        g_shell_xbus->Call("com.freebsdx.AppSandbox", static_cast<uint32_t>(AppSandboxOpcode::SetPermission),
+                           {reinterpret_cast<const uint8_t*>(&req), sizeof(req)}, nullptr);
+    };
+    auto pc_deny_btn  = std::make_shared<ButtonWidget>("Don't Allow", [pc_answer]() { pc_answer(false); });
+    auto pc_allow_btn = std::make_shared<ButtonWidget>("Allow", [pc_answer]() { pc_answer(true); });
+    auto pc_btn_row = std::make_shared<FlexRow>(std::vector<std::shared_ptr<Widget>>{
+        std::make_shared<Spacer>(1, 1, true),
+        pc_deny_btn, std::make_shared<Spacer>(10, 1), pc_allow_btn
+    });
+    auto pc_col = std::make_shared<FlexColumn>(std::vector<std::shared_ptr<Widget>>{
+        pc_title, std::make_shared<Spacer>(1, 8), pc_msg, std::make_shared<Spacer>(1, 16), pc_btn_row
+    });
+    pc_col->setPadding(16);
+    pc_col->setCrossAxisAlignment(CrossAxisAlignment::Stretch);
+    auto pc_overlay = std::make_shared<ContainerWidget>(pc_col);
+    pc_overlay->setBackgroundColor({0.13f, 0.14f, 0.20f, 0.97f});
+    pc_overlay->setFixedSize(460, 150);
+    pc_overlay->setVisibility(false);
+    *pc_overlay_ptr = pc_overlay;
+    g_show_consent = [pc_app_id, pc_perm, pc_title, pc_msg, pc_overlay](const AppSandboxConsentRequest& r) {
+        char id[sizeof(r.identifier_) + 1]{}, name[sizeof(r.display_name_) + 1]{};
+        std::memcpy(id, r.identifier_, sizeof(r.identifier_));
+        std::memcpy(name, r.display_name_, sizeof(r.display_name_));
+        const char* what = r.permission_ == 1 ? "your camera"
+                         : r.permission_ == 2 ? "your microphone"
+                         : r.permission_ == 5 ? "your screen (screen capture)"
+                                              : "a protected resource";
+        *pc_app_id = id;
+        *pc_perm   = r.permission_;
+        const std::string app = name[0] ? name : id;
+        pc_title->setText("Allow " + app + "?");
+        pc_msg->setText(app + " would like to use " + what + ".");
+        pc_overlay->setVisibility(true);
+    };
     g_show_times_up = [tu_app_id, tu_msg, tu_overlay](const AppTimeLimitReached& r) {
         char id[sizeof(r.app_id_) + 1]{}, name[sizeof(r.app_name_) + 1]{};
         std::memcpy(id, r.app_id_, sizeof(r.app_id_));
@@ -9535,7 +9591,7 @@ int main() {
     // The slot stays wired to the Wallpaper service calls below (harmless no-ops on
     // a detached widget) so re-enabling shell-side rendering later is a one-liner.
     auto root_overlay = std::make_shared<StackWidget>(std::vector<std::shared_ptr<Widget>>{
-        wallpaper, desktop, start_menu, search_portal, qs_panel, action_center, switcher_panel, vkb_anchor, fc_overlay, ch_overlay, cp_overlay, shortcuts_overlay, cal_popover, disp_overlay, osd_overlay, notes_overlay, tu_overlay
+        wallpaper, desktop, start_menu, search_portal, qs_panel, action_center, switcher_panel, vkb_anchor, fc_overlay, ch_overlay, cp_overlay, shortcuts_overlay, cal_popover, disp_overlay, osd_overlay, notes_overlay, tu_overlay, pc_overlay
     });
     root_overlay->setAlignment(Alignment::Center);
 
@@ -13175,6 +13231,13 @@ int main() {
             if (std::strcmp(msg.service_name_, "com.freebsdx.AppTimeLimit") == 0 &&
                 msg.opcode_ == static_cast<uint32_t>(AppTimeLimitOpcode::LimitsChanged)) {
                 if (rebuild_applimit && *rebuild_applimit) (*rebuild_applimit)();
+                return;
+            }
+            if (std::strcmp(msg.service_name_, "com.freebsdx.AppSandbox") == 0 &&
+                msg.opcode_ == static_cast<uint32_t>(AppSandboxOpcode::ConsentRequested)) {
+                AppSandboxConsentRequest r{};
+                std::memcpy(&r, msg.payload_, sizeof(r));
+                if (g_show_consent) g_show_consent(r);
                 return;
             }
             if (std::strcmp(msg.service_name_, "com.freebsdx.AppTimeLimit") == 0 &&
