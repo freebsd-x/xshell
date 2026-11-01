@@ -6,6 +6,7 @@
 #include <cerrno>
 #include <cstring>
 #include <algorithm>
+#include <iterator>
 #include <ctime>
 #include <thread>
 
@@ -146,12 +147,13 @@ void buildMountedVolumesPanel(ShellContext& ctx) {
                 [vol_col, fetch_weak](const XBusMessage& r) {
                     VolumePage vp{};
                     std::memcpy(&vp, r.payload_, sizeof(vp));
-                    for (uint32_t i = 0; i < vp.count_; ++i) {
+                    const uint32_t count = std::min<uint32_t>(vp.count_, std::size(vp.entries_));
+                    for (uint32_t i = 0; i < count; ++i) {
                         const auto& e = vp.entries_[i];
                         // Usage percentage and bar (10 blocks)
                         double pct = (e.total_kb_ > 0)
-                            ? 100.0 * static_cast<double>(e.used_kb_)
-                                    / static_cast<double>(e.total_kb_)
+                            ? std::clamp(100.0 * static_cast<double>(e.used_kb_)
+                                             / static_cast<double>(e.total_kb_), 0.0, 100.0)
                             : 0.0;
                         int filled = static_cast<int>(pct / 10.0);
                         std::string bar;
