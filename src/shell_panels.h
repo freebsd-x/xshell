@@ -9,6 +9,8 @@
 // main.cc's `using namespace` convention so the ShellContext members and the
 // builder bodies can name widgets/IPC types unqualified.
 
+#include <map>
+#include "xkit/audio_player.h"
 #include "xkit/widget.h"
 #include "xkit/clipboard.h"
 #include "xkit/xbus_client.h"
@@ -115,6 +117,66 @@ void launchApp(const std::string& exec_path, const std::string& file_path = "") 
 // and refresh timer reference it. Grows one panel cluster at a time. main() keeps
 // reference-aliases with the original local names, so downstream code — including
 // the big broadcast/timer capture lists — is untouched by each extraction.
+// ── Shared with the broadcast dispatcher (shell_broadcast.cc) ────────────────
+// Defined in main.cc; declared here so the dispatcher can reach them.
+inline constexpr int kNumWorkspaces      = 1;   // single workspace (WindowStack::kWorkspaceCount)
+inline constexpr int kMaxTaskbarWindows  = 7;   // pre-allocated taskbar window chips
+inline constexpr int kMaxSwitcherWindows = 7;   // pre-allocated Alt+Tab chips
+struct TaskbarChip {
+    uint32_t surface_id{0};
+    std::shared_ptr<TextWidget>  label;
+    std::shared_ptr<FlexColumn> card;
+};
+struct SwitcherChip {
+    uint32_t surface_id{0};
+    std::shared_ptr<TextWidget>  label;
+    std::shared_ptr<FlexColumn> card;
+};
+struct NotifEntry {
+    uint32_t                     id{0};
+    std::string                  title;
+    std::string                  message;
+    std::string                  time_str;   // "HH:MM" at arrival
+    std::shared_ptr<FlexColumn>  card;       // the card widget
+    bool                         dismissed{false};
+};
+struct WinRule {
+    std::string title_match;          // substring matched (case-insensitive) against window title
+    bool        maximize{false};
+    bool        always_on_top{false};
+    int         workspace{-1};        // -1 = don't assign; 0-based workspace index
+};
+struct HotkeyDef {
+    const char*  name;
+    uint32_t     action_id;  // InputEventType value
+    uint32_t     def_kc;     // default keycode (K_* constant)
+    uint32_t     def_mods;   // default modifiers (Super=8)
+};
+inline constexpr HotkeyDef kHotkeyDefs[] = {
+    {"Search",        6,  57, 8},  // Super+Space
+    {"Dashboard",     7,  30, 8},  // Super+A
+    {"Quick Note",   45,  49, 8},  // Super+N
+    {"Clipboard",    37,  47, 8},  // Super+V
+    {"Color Picker", 38,  25, 8},  // Super+P
+    {"Help",         44,  53, 8},  // Super+/
+};
+inline constexpr int kNumHotkeys = 6;
+std::string fmtHotkey(uint32_t kc, uint32_t mods) noexcept;
+void saveHotkeys() noexcept;
+extern std::atomic<int> g_hotkey_capture_action;   // -1 = idle; ≥0 = capturing for that action
+extern std::map<uint32_t, std::pair<uint32_t, uint32_t>> g_hotkey_overrides;
+extern std::vector<WinRule> g_win_rules;
+extern std::set<uint32_t>   g_rule_applied_ids;    // surface ids already processed
+extern bool g_shell_dark;                          // follows the Theme service
+extern std::function<void(const AppTimeLimitReached&)> g_show_times_up;
+extern std::function<void(const AppSandboxConsentRequest&)> g_show_consent;
+void saveRecentFiles() noexcept;
+bool runningWindowTakesFile(const std::string& exec_path, const std::string& file_path);
+extern std::set<std::string>           g_dnd_exceptions;        // app names allowed through DND
+extern std::atomic<uint32_t>           g_dnd_suppressed_count;
+extern std::mutex                      g_dnd_digest_mtx;
+extern std::map<std::string, uint32_t> g_dnd_suppressed_apps;  // app → suppressed count
+
 struct ShellContext {
     // Game Mode
     std::shared_ptr<TextWidget>   gm_status_lbl;
@@ -1168,7 +1230,93 @@ struct ShellContext {
     std::shared_ptr<int>              tp_idx;
     std::function<void(int)>          apply_tp;
     std::shared_ptr<FlexRow>          theme_presets_row;
+    // ── Handles the broadcast dispatcher (shell_broadcast.cc) reads that no
+    // panel builder owns: set in main() where the dispatcher is registered.
+    std::shared_ptr<ContainerWidget> ch_overlay;
+    std::shared_ptr<std::vector<std::pair<unsigned int, std::string>>> ch_entries;
+    std::shared_ptr<std::shared_ptr<Widget>> ch_list_col_ptr;
+    std::shared_ptr<std::function<void ()>> rebuild_ch;
+    std::shared_ptr<std::function<void ()>> reload_ch;
+    std::shared_ptr<ContainerWidget> cp_overlay;
+    std::shared_ptr<FlexColumn> search_portal;
+    std::shared_ptr<FlexColumn> action_center;
+    std::shared_ptr<std::vector<NotifEntry>> notif_history;
+    std::shared_ptr<FlexColumn> notif_list_col;
+    std::shared_ptr<TextWidget> notif_empty_lbl;
+    std::function<std::shared_ptr<FlexColumn>(uint32_t, const std::string&, const std::string&, const std::string&, const std::string&)> make_notif_card;
+    std::shared_ptr<std::array<std::shared_ptr<TextWidget>, 1>> ws_pips;
+    std::shared_ptr<std::array<SwitcherChip, 7>> switcher_chips;
+    std::shared_ptr<FlexColumn> switcher_panel;
+    std::shared_ptr<std::array<TaskbarChip, 7>> tbar_chips;
+    std::shared_ptr<std::array<unsigned int, 7>> tbar_ids;
+    std::vector<fbx::xshell::AppMetadata> apps;
+    std::shared_ptr<ButtonWidget> net_btn;
+    std::function<void (const RemoteDesktopStatus &)> update_rd_ui;
+    std::function<void (const HotspotStatus &)> update_hs_ui;
+    std::shared_ptr<std::function<void ()>> rebuild_pkg;
+    std::function<void (const AdBlockStatus &)> update_ab_ui;
+    std::function<void(const AccessibilityQuickSettings&)> update_a11y_ui;
+    std::shared_ptr<std::function<void ()>> rebuild_dl;
+    std::function<void (const ScrollDirState &)> update_scroll_dir_ui;
+    std::function<void (const TouchpadState &)> update_touchpad_ui;
+    std::function<void (const ReduceMotionState &)> update_reduce_motion_ui;
+    std::function<void(const HotspotState&)> update_hotspot_ui;
+    std::shared_ptr<std::function<void ()>> rebuild_perms;
+    std::shared_ptr<std::function<void ()>> rebuild_im;
+    std::function<void (const FirewallStatus &)> update_fw_ui;
+    std::shared_ptr<SwitchWidget> qs_wifi_switch;
+    std::shared_ptr<TextWidget> qs_wifi_sub;
+    std::shared_ptr<SwitchWidget> qs_bt_switch;
+    std::shared_ptr<ButtonWidget> bt_btn;
+    std::shared_ptr<SwitchWidget> qs_dark_switch;
+    std::shared_ptr<ButtonWidget> weather_btn;
+    std::shared_ptr<ContainerWidget> fc_overlay;
+    std::shared_ptr<unsigned int> fc_request_id;
+    std::shared_ptr<std::string> fc_current_path;
+    std::shared_ptr<std::string> fc_filter_mime;
+    std::shared_ptr<bool> fc_save_mode;
+    std::shared_ptr<TextWidget> fc_title_w;
+    std::shared_ptr<ButtonWidget> fc_ok_btn;
+    std::shared_ptr<TextInputWidget> fc_save_field;
+    std::shared_ptr<TextWidget> fc_sel_w;
+    std::shared_ptr<std::string> fc_selected;
+    std::shared_ptr<std::function<void (const std::string &)>> rebuild_fc;
+    std::shared_ptr<FlexColumn> wallpaper_img_slot;
+    std::shared_ptr<AudioPlayer> audio;
+    std::shared_ptr<ContainerWidget> shortcuts_overlay;
+    std::shared_ptr<std::vector<std::string>> known_apps;
+    std::shared_ptr<std::set<std::string>> muted_apps;
+    std::shared_ptr<std::function<void ()>> rebuild_app_list;
+    std::function<void(const DisplayOutputList&)> rebuild_disp;
+    std::shared_ptr<SwitchWidget> qs_dnd_switch;
+    std::shared_ptr<ContainerWidget> notes_overlay;
+    std::shared_ptr<FlexColumn> win_rules_col;
+    std::shared_ptr<std::function<void ()>> rebuild_win_rules;
+    std::shared_ptr<TextWidget> hotkey_status_lbl;
+    std::shared_ptr<std::function<void ()>> rebuild_hotkeys;
+    std::function<void(const DnsResolverConfig&)> update_dns_cfg_ui;
+    std::function<void (const SpatialAudioConfig &)> update_sa_ui;
+    std::function<void (const SystemSoundsState &)> update_sndfx_ui;
+    std::function<void (const LiveCaptionsState &)> update_captions_ui;
+    std::function<void (const DataSaverState &)> update_dsaver_ui;
+    std::function<void (const FastChargingState &)> update_fastchg_ui;
+    std::function<void (const DoNotDisturbState &)> update_silence_ui;
+    std::function<void (const TrueToneState &)> update_ttone_ui;
+    std::function<void (const OptStorageState &)> update_ostore_ui;
+    std::function<void (const MonoAudioState &)> update_monoaud_ui;
+    std::function<void (const StageManagerState &)> update_stagemgr_ui;
+    std::shared_ptr<TextWidget> iapps_prog_lbl;
+    std::shared_ptr<std::function<void ()>> rebuild_disp_arr;
+    std::shared_ptr<std::function<void ()>> rebuild_fonts;
+    std::shared_ptr<std::function<void ()>> rebuild_iapps;
+    std::shared_ptr<std::function<void (std::string)>> rebuild_store;
+    std::shared_ptr<std::function<void ()>> rebuild_term_sess;
+    std::function<void(const AccessibilitySettings&)> update_a11y_ui_c;
+    std::shared_ptr<TextInputWidget> store_search_input;
 };
+// Routes one XBus broadcast to the panels (shell_broadcast.cc).
+void dispatchShellBroadcast(ShellContext& ctx, const XBusMessage& msg);
+
 
 // ── Builder prototypes (definitions relocated to shell_panels.cc) ─────────────
 void buildCronJobsPanel(ShellContext& ctx);
