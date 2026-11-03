@@ -15,7 +15,12 @@ inc_dir = include_directories(
 # In production, xkit would be a shared library (.so)
 src_files = [
   'src/main.cc',
-  'src/shell_panels.cc',
+  'src/shell_panels_system.cc',
+  'src/shell_panels_storage.cc',
+  'src/shell_panels_network.cc',
+  'src/shell_panels_devices.cc',
+  'src/shell_panels_display.cc',
+  'src/shell_panels_desktop.cc',
   '../../sdk/xkit/src/widget.cc',
   '../../sdk/xkit/src/audio_player.cc',
   '../../sdk/xrender/src/display_list.cc',
