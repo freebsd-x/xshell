@@ -583,6 +583,20 @@ void dispatchShellBroadcast(ShellContext& ctx, const XBusMessage& msg) {
                 msg.opcode_ == static_cast<uint32_t>(FileChooserOpcode::Show)) {
                 FileChooserRequest req{};
                 std::memcpy(&req, msg.payload_, sizeof(req));
+                req.title_[sizeof(req.title_) - 1] = '\0';
+                req.filter_mime_[sizeof(req.filter_mime_) - 1] = '\0';
+                req.initial_path_[sizeof(req.initial_path_) - 1] = '\0';
+
+                // One picker at a time: whoever was waiting gets an answer.
+                if (fc_overlay->isVisible() && *fc_request_id != 0 && g_shell_xbus) {
+                    FileChooserResponse gone{};
+                    gone.opcode_     = static_cast<uint32_t>(FileChooserOpcode::Respond);
+                    gone.request_id_ = *fc_request_id;
+                    gone.cancelled_  = 1;
+                    g_shell_xbus->Call("com.freebsdx.FileChooser",
+                        static_cast<uint32_t>(FileChooserOpcode::Respond),
+                        {reinterpret_cast<const uint8_t*>(&gone), sizeof(gone)}, nullptr);
+                }
 
                 *fc_request_id = req.request_id_;
                 *fc_filter_mime = req.filter_mime_;
@@ -592,7 +606,7 @@ void dispatchShellBroadcast(ShellContext& ctx, const XBusMessage& msg) {
                                                    : (*fc_save_mode ? "Save File" : "Open File"));
                 fc_ok_btn->setText(*fc_save_mode ? "Save" : "Open");
                 fc_save_field->setVisibility(*fc_save_mode);
-                fc_sel_w->setVisibility(!*fc_save_mode);
+                fc_save_field->setText("");
 
                 std::string start = req.initial_path_[0]
                     ? std::string(req.initial_path_)

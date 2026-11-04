@@ -8616,6 +8616,8 @@ int main() {
     fc_path_w->setColor({0.65f, 0.70f, 0.80f, 1.0f});
 
     auto fc_list_col = std::make_shared<FlexColumn>(std::vector<std::shared_ptr<Widget>>{});
+    // Rows take the panel's width: a long name shows whole, and a row is a big target.
+    fc_list_col->setCrossAxisAlignment(CrossAxisAlignment::Stretch);
 
     auto fc_sel_w = std::make_shared<TextWidget>("", 12.0f);
     fc_sel_w->setColor({0.55f, 0.85f, 0.55f, 1.0f});
@@ -8625,8 +8627,9 @@ int main() {
     // rebuild_fc — populates fc_list_col from a directory path.
     // Uses std::filesystem directly (xshell is a trusted, non-sandboxed process).
     auto rebuild_fc = std::make_shared<std::function<void(const std::string&)>>();
+    auto fc_confirm = std::make_shared<std::function<void()>>();   // what the Open/Save button does
     *rebuild_fc = [fc_list_col, fc_current_path, fc_path_w, fc_filter_mime,
-                   fc_selected, fc_sel_w,
+                   fc_selected, fc_sel_w, fc_confirm,
                    rebuild_fc_weak = std::weak_ptr<std::function<void(const std::string&)>>(rebuild_fc)](
                        const std::string& path) {
         namespace fs = std::filesystem;
@@ -8703,7 +8706,8 @@ int main() {
                     std::make_shared<TextWidget>(icon, 13.0f),
                     std::make_shared<Spacer>(6, 1),
                     [&]{ auto w = std::make_shared<TextWidget>(label, 12.0f);
-                         w->setColor({0.9f, 0.9f, 0.95f, 1.0f}); return w; }()
+                         w->setColor({0.9f, 0.9f, 0.95f, 1.0f}); return w; }(),
+                    std::make_shared<Spacer>(1, 1, true)   // names start at the left
                 });
                 std::string fp = full_path;
                 auto rf_w = rebuild_fc_weak;
@@ -8715,12 +8719,15 @@ int main() {
                     std::make_shared<TextWidget>(icon, 13.0f),
                     std::make_shared<Spacer>(6, 1),
                     [&]{ auto w = std::make_shared<TextWidget>(label, 12.0f);
-                         w->setColor({0.9f, 0.9f, 0.95f, 1.0f}); return w; }()
+                         w->setColor({0.9f, 0.9f, 0.95f, 1.0f}); return w; }(),
+                    std::make_shared<Spacer>(1, 1, true)   // names start at the left
                 });
                 std::string fp = full_path;
                 auto sel = fc_selected;
                 auto sel_w = fc_sel_w;
-                entry_row = std::make_shared<ButtonWidget>(row, [fp, sel, sel_w]() {
+                // Activating the selected file again opens it (double-click, Enter Enter).
+                entry_row = std::make_shared<ButtonWidget>(row, [fp, sel, sel_w, fc_confirm]() {
+                    if (*sel == fp) { if (*fc_confirm) (*fc_confirm)(); return; }
                     *sel = fp;
                     auto f = std::filesystem::path(fp).filename().string();
                     sel_w->setText(f);
@@ -8959,12 +8966,21 @@ int main() {
     auto fc_wp_ws_idx = std::make_shared<int>(-1);
     auto fc_ok_btn = std::make_shared<ButtonWidget>("Open",
         [fc_overlay_ptr, fc_request_id, fc_selected, fc_save_mode, fc_current_path, fc_save_field,
-         fc_wp_ws_idx]() {
+         fc_wp_ws_idx, fc_sel_w]() {
             std::string path;
             if (*fc_save_mode) {
                 std::string fname = fc_save_field->getText();
-                if (fname.empty()) return;
+                // A name, not a way somewhere else.
+                if (fname.empty() || fname == "." || fname == ".." ||
+                    fname.find('/') != std::string::npos) return;
                 path = *fc_current_path + "/" + fname;
+                // Saving over a file needs a second press: it would be replaced.
+                std::error_code ec;
+                if (std::filesystem::exists(path, ec) && *fc_selected != path) {
+                    *fc_selected = path;
+                    fc_sel_w->setText("\"" + fname + "\" exists. Press Save again to replace it.");
+                    return;
+                }
             } else {
                 path = *fc_selected;
                 if (path.empty()) return;
@@ -9000,10 +9016,20 @@ int main() {
             if (*fc_overlay_ptr) (*fc_overlay_ptr)->setVisibility(false);
         });
     fc_ok_btn->setPadding(8);
+    *fc_confirm = [fc_ok_btn_w = std::weak_ptr<ButtonWidget>(fc_ok_btn)]() {
+        if (auto b = fc_ok_btn_w.lock()) b->click();
+    };
+    // Enter in the name field is the Save button; a new name needs a new "replace?".
+    fc_save_field->setOnSubmit([fc_ok_btn](const std::string&) { fc_ok_btn->click(); });
+    fc_save_field->setOnChanged([fc_selected, fc_sel_w](const std::string&) {
+        *fc_selected = "";
+        fc_sel_w->setText("");
+    });
     fc_ok_btn->setBackgroundColor({0.22f, 0.45f, 0.88f, 1.0f});
 
     auto fc_cancel_btn = std::make_shared<ButtonWidget>("Cancel",
         [fc_overlay_ptr, fc_request_id]() {
+            if (*fc_overlay_ptr) (*fc_overlay_ptr)->setVisibility(false);
             if (!g_shell_xbus) return;
             FileChooserResponse resp{};
             resp.opcode_      = static_cast<uint32_t>(FileChooserOpcode::Respond);
@@ -9024,6 +9050,7 @@ int main() {
         fc_back_btn, std::make_shared<Spacer>(10, 1), fc_path_w
     });
     fc_nav_row->setPadding(8);
+    fc_nav_row->setCrossAxisAlignment(CrossAxisAlignment::Center);
 
     auto fc_btn_row = std::make_shared<FlexRow>(std::vector<std::shared_ptr<Widget>>{
         std::make_shared<Spacer>(1, 1, true),
@@ -9624,10 +9651,9 @@ int main() {
             g_shell_xbus->Call("com.freebsdx.Notes", op,
                 {reinterpret_cast<const uint8_t*>(&entry), sizeof(entry)},
                 [qn_note_id](const XBusMessage& r) {
-                    NotesListPage pg{};
-                    std::memcpy(&pg, r.payload_, sizeof(pg));
-                    if (pg.count_ > 0 && pg.entry_.id_)
-                        *qn_note_id = pg.entry_.id_;
+                    NotesStatusResponse sr{};
+                    std::memcpy(&sr, r.payload_, sizeof(sr));
+                    if (sr.success_ && sr.id_) *qn_note_id = sr.id_;   // the next save updates it
                 });
         });
 
@@ -9677,10 +9703,12 @@ int main() {
             notes_overlay, shortcuts_overlay, fc_overlay, pc_overlay, tu_overlay};
         auto grabbed = std::make_shared<bool>(false);
         auto search_was_open = std::make_shared<bool>(false);
+        auto fc_was_open = std::make_shared<bool>(false);
         // Taskbar theme state: design colours of its items, and the theme last applied.
         auto tb_design = std::make_shared<taskbar_theme::DesignMap>();
         auto tb_applied_dark = std::make_shared<int>(-1);   // -1: not yet applied
         XApplication::setOnFrame([kb_popups, grabbed, search_was_open, search_portal, search_input,
+                                  fc_was_open, fc_overlay, fc_save_mode, fc_save_field, fc_back_btn,
                                   taskbar, start_row, logo_on_dark, logo_on_light,
                                   tb_design, tb_applied_dark]() {
             // The taskbar follows the theme. Re-applied every frame in the light
@@ -9712,18 +9740,27 @@ int main() {
             const bool search_open = search_portal->isVisible();
             if (search_open && !*search_was_open) (void)XApplication::focusWidget(search_input);
             *search_was_open = search_open;
+            // The picker opens ready for the keyboard: the name field when
+            // saving; for opening, Tab goes from Back into the files.
+            const bool fc_open = fc_overlay->isVisible();
+            if (fc_open && !*fc_was_open) {
+                if (*fc_save_mode) (void)XApplication::focusWidget(fc_save_field);
+                else               (void)XApplication::focusWidget(fc_back_btn);
+            }
+            *fc_was_open = fc_open;
         });
         // Esc closes the topmost open popup (not the permission / Time's-up
-        // cards or the file chooser: those need an answer). In search, ↓ / ↑
+        // cards: those need an answer) and cancels the file chooser. In search, ↓ / ↑
         // move through the results (Enter opens one).
         const std::vector<std::shared_ptr<Widget>> esc_order{
             shortcuts_overlay, notes_overlay, cp_overlay, ch_overlay, search_portal,
             start_menu, action_center, qs_panel};
-        XApplication::setOnShortcut([esc_order, search_portal](const InputMessage& in) {
+        XApplication::setOnShortcut([esc_order, search_portal, fc_overlay, fc_cancel_btn](const InputMessage& in) {
             if (in.type_ != InputEventType::KeyPress || in.value_b_ == 0 || (in.modifiers_ & (2u | 4u | 8u)))
                 return false;
             constexpr int kEsc = 1, kUp = 103, kDown = 108;
             if (in.value_a_ == kEsc) {
+                if (fc_overlay->isVisible()) { fc_cancel_btn->click(); return true; }
                 for (const auto& w : esc_order)
                     if (w && w->isVisible()) { w->setVisibility(false); return true; }
                 return false;

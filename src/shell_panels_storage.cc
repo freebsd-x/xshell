@@ -532,8 +532,10 @@ void buildStoragePanel(ShellContext& ctx) {
         pf->fmtBr = fmtBar;
         pf->fetch = [pf_weak = std::weak_ptr<PoolFetcher>(pf)](uint32_t page) {
             if (!g_shell_xbus) return;
+            uint32_t pg_num = page;
             g_shell_xbus->Call("com.freebsdx.Disk",
-                static_cast<uint32_t>(DiskOpcode::ListZpools), {},
+                static_cast<uint32_t>(DiskOpcode::ListZpools),
+                {reinterpret_cast<const uint8_t*>(&pg_num), sizeof(pg_num)},
                 [pf_weak, page](const XBusMessage& resp) {
                     auto pf = pf_weak.lock();
                     if (!pf) return;
