@@ -832,12 +832,12 @@ static pid_t spawnChild(std::vector<std::string> args,
     return pid;
 }
 
-// Apps that load a file sent to them as a LaunchWithFile broadcast into
-// their open window. Opening a file in one of these while it runs reuses that
-// window instead of starting a second copy. (Other apps open a window per file.)
+// Apps that load what's sent to them as a LaunchWithFile broadcast into their
+// open window, instead of starting a second copy. Only for what doesn't need a
+// file opened: a sandboxed app can't open a path it's told once it's running, so
+// every app that reads files gets a new window, which opens it during start-up.
 static bool opensInRunningWindow(const std::string& app_id) {
-    return app_id == "com.freebsdx.imageviewer" || app_id == "com.freebsdx.videoplayer" ||
-           app_id == "com.freebsdx.browser";
+    return app_id == "com.freebsdx.browser";
 }
 
 // Is an instance of this executable, launched by the shell, still alive?
