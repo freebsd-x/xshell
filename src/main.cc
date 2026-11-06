@@ -832,30 +832,6 @@ static pid_t spawnChild(std::vector<std::string> args,
     return pid;
 }
 
-// Apps that load what's sent to them as a LaunchWithFile broadcast into their
-// open window, instead of starting a second copy. Only for what doesn't need a
-// file opened: a sandboxed app can't open a path it's told once it's running, so
-// every app that reads files gets a new window, which opens it during start-up.
-static bool opensInRunningWindow(const std::string& app_id) {
-    return app_id == "com.freebsdx.browser";
-}
-
-// Is an instance of this executable, launched by the shell, still alive?
-static bool appRunning(const std::string& exec_path) {
-    const std::string name = std::filesystem::path(exec_path).filename().string();
-    std::lock_guard<std::mutex> lk(g_child_pids_mtx);
-    for (const auto& [pid, display] : g_child_pids)
-        if (display == name && ::kill(pid, 0) == 0) return true;
-    return false;
-}
-
-// Would a LaunchWithFile for this app and file be taken by its open window?
-bool runningWindowTakesFile(const std::string& exec_path, const std::string& file_path) {
-    auto it = g_app_ids.find(exec_path);
-    return it != g_app_ids.end() && opensInRunningWindow(it->second) && !file_path.empty() &&
-           file_path.size() < sizeof(ShellLaunchRequest::file_path_) && appRunning(exec_path);
-}
-
 void launchApp(const std::string& exec_or_id,
                       const std::string& file_path) noexcept {
     // Callers that open a file pass the MIME handler's app identifier
@@ -870,17 +846,6 @@ void launchApp(const std::string& exec_or_id,
             LOG_WARN("Launching: no installed app '{}'", exec_or_id);
             return;
         }
-    }
-    if (g_shell_xbus && runningWindowTakesFile(exec_path, file_path)) {
-        // The running window loads it (the broadcast also reaches this shell,
-        // whose LaunchWithFile handler sees the same and doesn't relaunch).
-        ShellLaunchRequest req{};
-        std::strncpy(req.app_id_, g_app_ids[exec_path].c_str(), sizeof(req.app_id_) - 1);
-        std::strncpy(req.file_path_, file_path.c_str(), sizeof(req.file_path_) - 1);
-        LOG_INFO("Opening {} in the running {}", file_path, req.app_id_);
-        g_shell_xbus->Call("com.freebsdx.Shell", static_cast<uint32_t>(ShellOpcode::LaunchWithFile),
-                           {reinterpret_cast<const uint8_t*>(&req), sizeof(req)}, nullptr);
-        return;
     }
     LOG_INFO("Launching: {}{}", exec_path, file_path.empty() ? "" : " --open " + file_path);
     recordAppLaunch();

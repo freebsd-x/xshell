@@ -435,9 +435,7 @@ void dispatchShellBroadcast(ShellContext& ctx, const XBusMessage& msg) {
                     std::string file_path(req.file_path_);
                     for (const auto& app : apps) {
                         if (app.identifier == app_id) {
-                            // A running viewer takes this broadcast itself.
-                            if (!runningWindowTakesFile(app.executable_path, file_path))
-                                launchApp(app.executable_path, file_path);
+                            launchApp(app.executable_path, file_path);
                             // Record in recent files
                             if (!file_path.empty()) {
                                 std::string fname = file_path.substr(

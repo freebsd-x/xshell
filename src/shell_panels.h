@@ -171,7 +171,6 @@ extern bool g_shell_dark;                          // follows the Theme service
 extern std::function<void(const AppTimeLimitReached&)> g_show_times_up;
 extern std::function<void(const AppSandboxConsentRequest&)> g_show_consent;
 void saveRecentFiles() noexcept;
-bool runningWindowTakesFile(const std::string& exec_path, const std::string& file_path);
 extern std::set<std::string>           g_dnd_exceptions;        // app names allowed through DND
 extern std::atomic<uint32_t>           g_dnd_suppressed_count;
 extern std::mutex                      g_dnd_digest_mtx;
