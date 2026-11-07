@@ -436,8 +436,8 @@ void dispatchShellBroadcast(ShellContext& ctx, const XBusMessage& msg) {
                     for (const auto& app : apps) {
                         if (app.identifier == app_id) {
                             launchApp(app.executable_path, file_path);
-                            // Record in recent files
-                            if (!file_path.empty()) {
+                            // Record in recent files: files, not addresses or "chromium:" pages.
+                            if (file_path.starts_with('/')) {
                                 std::string fname = file_path.substr(
                                     file_path.find_last_of("/\\") + 1);
                                 g_recent_files.erase(
